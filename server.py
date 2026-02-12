@@ -1,6 +1,7 @@
 """MCP server for Early (Timeular) time tracking."""
 
 import os
+import re
 from datetime import datetime, timezone
 
 import httpx
@@ -47,6 +48,8 @@ def _to_api_ts(dt_str: str) -> str:
 
     The Timeular API expects ISO 8601 with millisecond precision.
     """
+    if not dt_str:
+        return _now_api_ts()
     dt_str = dt_str.strip()
     if len(dt_str) == 10:  # YYYY-MM-DD
         return f"{dt_str}T00:00:00.000"
@@ -62,6 +65,8 @@ def _now_api_ts() -> str:
 
 def _end_of_day_api_ts(date_str: str) -> str:
     """Convert YYYY-MM-DD to end-of-day API timestamp."""
+    if not date_str:
+        return _now_api_ts()
     return f"{date_str.strip()}T23:59:59.999"
 
 
@@ -69,9 +74,9 @@ def _format_note(note: dict | None) -> str:
     """Format a note object from the API into readable text."""
     if not note:
         return ""
-    text = note.get("text", "")
-    tags = note.get("tags", [])
-    mentions = note.get("mentions", [])
+    text = note.get("text") or ""
+    tags = note.get("tags") or []
+    mentions = note.get("mentions") or []
     # Replace tag placeholders with readable labels
     for tag in tags:
         tag_id = tag.get("id")
@@ -85,6 +90,47 @@ def _format_note(note: dict | None) -> str:
         key = mention.get("key", "")
         text = text.replace(f"<{{{{|m|{m_id}|}}}}>" , f"@{key}")
     return text.strip()
+
+
+async def _resolve_mention_by_key(key: str) -> dict | None:
+    """Find the correct mention for a key, preferring the lowest ID (primary space)."""
+    client = await _client()
+    resp = await client.get("/tags-and-mentions")
+    resp.raise_for_status()
+    data = resp.json()
+    matches = [m for m in data.get("mentions", []) if m.get("key") == key]
+    if not matches:
+        return None
+    return min(matches, key=lambda m: m["id"])
+
+
+async def _build_note(text: str) -> dict:
+    """Build a full note object, resolving mention/tag references in text.
+
+    Parses <{{|m|ID|}}> and <{{|t|ID|}}> from text and populates the
+    mentions/tags arrays with the full objects from the API.
+    """
+    mention_ids = [int(m) for m in re.findall(r"<\{\{\|m\|(\d+)\|\}\}>", text)]
+    tag_ids = [int(t) for t in re.findall(r"<\{\{\|t\|(\d+)\|\}\}>", text)]
+
+    mentions = []
+    tags = []
+
+    if mention_ids or tag_ids:
+        client = await _client()
+        resp = await client.get("/tags-and-mentions")
+        resp.raise_for_status()
+        data = resp.json()
+
+        if mention_ids:
+            all_mentions = {m["id"]: m for m in data.get("mentions", [])}
+            mentions = [all_mentions[mid] for mid in mention_ids if mid in all_mentions]
+
+        if tag_ids:
+            all_tags = {t["id"]: t for t in data.get("tags", [])}
+            tags = [all_tags[tid] for tid in tag_ids if tid in all_tags]
+
+    return {"text": text, "tags": tags, "mentions": mentions}
 
 
 def _format_entry(entry: dict) -> dict:
@@ -198,7 +244,7 @@ async def early_edit_current_tracking(
     client = await _client()
     body: dict = {}
     if note:
-        body["note"] = {"text": note}
+        body["note"] = await _build_note(note)
     if activity_id:
         body["activityId"] = activity_id
     if started_at:
@@ -250,7 +296,7 @@ async def early_create_time_entry(
         "stoppedAt": _to_api_ts(stopped_at),
     }
     if note:
-        body["note"] = {"text": note}
+        body["note"] = await _build_note(note)
     resp = await client.post("/time-entries", json=body)
     resp.raise_for_status()
     return _format_entry(resp.json())
@@ -286,9 +332,10 @@ async def early_update_time_entry(
     if stopped_at:
         body["stoppedAt"] = _to_api_ts(stopped_at)
     if note:
-        body["note"] = {"text": note}
+        body["note"] = await _build_note(note)
     resp = await client.patch(f"/time-entries/{time_entry_id}", json=body)
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        return {"error": resp.status_code, "detail": resp.text, "body_sent": body}
     return _format_entry(resp.json())
 
 
@@ -306,7 +353,7 @@ async def early_delete_time_entry(time_entry_id: str) -> dict:
 
 
 @mcp.tool()
-async def early_get_tags() -> list[dict]:
+async def early_get_tags() -> dict:
     """Get all available tags and mentions.
 
     Returns all tags — use this to check if a ClickUp task tag (e.g. WEB-3343)
@@ -349,6 +396,49 @@ async def early_create_tag(label: str, key: str) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+
+@mcp.tool()
+async def early_create_mention(label: str, key: str) -> dict:
+    """Create a new mention.
+
+    Use this to create a mention for a ClickUp task ID that doesn't exist yet.
+    After creating, use the returned mention ID in notes as <{{|m|MENTION_ID|}}>.
+
+    Args:
+        label: Display label (e.g. 'WEB-3227 - Contact us page').
+        key: Unique key (e.g. 'WEB-3227').
+    """
+    client = await _client()
+    # Try multiple body formats — API docs are sparse
+    bodies = [
+        {"key": key, "label": label},
+        {"key": key, "label": label, "scope": "timeular", "spaceId": "99803"},
+        {"key": key, "label": label, "scope": "timeular", "space_id": "99803"},
+    ]
+    for body in bodies:
+        resp = await client.post("/mentions", json=body)
+        if resp.status_code < 400:
+            return resp.json()
+    return {"error": resp.status_code, "detail": resp.text, "last_body": bodies[-1]}
+
+
+@mcp.tool()
+async def early_debug_update(time_entry_id: str, note_json: str) -> dict:
+    """Debug: update a time entry with a raw JSON note object.
+
+    Args:
+        time_entry_id: The time entry ID.
+        note_json: Raw JSON string for the note object.
+    """
+    import json
+    client = await _client()
+    note_obj = json.loads(note_json)
+    resp = await client.patch(
+        f"/time-entries/{time_entry_id}",
+        json={"note": note_obj},
+    )
+    return {"status": resp.status_code, "body": resp.text}
 
 
 if __name__ == "__main__":
